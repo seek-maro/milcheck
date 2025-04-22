@@ -1,0 +1,250 @@
+name: Claude Code Review
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        required: true
+        type: number
+        description: "Pull request number"
+      head-sha:
+        required: true
+        type: string
+        description: "Head commit SHA of the PR"
+      base-branch:
+        required: true
+        type: string
+        description: "Base branch of the PR (typically main or master)"
+      repository:
+        required: true
+        type: string
+        description: "Repository name in owner/repo format"
+      trigger-phrase:
+        required: false
+        type: string
+        default: '@milcheck'
+        description: "Trigger phrase for comment-based reviews"
+      max-files:
+        required: false
+        type: number
+        default: 50
+        description: "Maximum number of files to review"
+      use-milchick-voice:
+        required: false
+        type: boolean
+        default: false
+        description: "If true, instructs the reviewer to use the voice of Seth Milchick from Severance."
+    secrets:
+      github-token:
+        required: true
+        description: "GitHub token with repo access"
+      shortcut-token:
+        required: true
+        description: "Shortcut API token"
+      anthropic-api-key:
+        required: true
+        description: "Anthropic API key"
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  claude-review:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.head-sha }}
+          fetch-depth: 0
+          token: ${{ secrets.github-token }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          npm install -g @anthropic-ai/claude-code@0.2.74
+          echo "Claude Code installed successfully"
+
+      - name: Create review directories
+        shell: bash
+        run: |
+          mkdir -p .claude-review/pr-info
+
+      - name: Extract PR information
+        shell: bash
+        run: |
+          # Fetch PR details
+          PR_INFO=$(curl -s -H "Authorization: token ${{ secrets.github-token }}" \
+            "https://api.github.com/repos/${{ inputs.repository }}/pulls/${{ inputs.pr-number }}")
+          
+          if [ -z "$PR_INFO" ]; then
+            echo "Error: Failed to fetch PR information. Check the repository and PR number."
+            exit 1
+          fi
+
+          PR_TITLE=$(echo "$PR_INFO" | jq -r .title)
+          PR_AUTHOR=$(echo "$PR_INFO" | jq -r .user.login)
+          TARGET_BRANCH="${{ inputs.base-branch }}"
+          
+          # Save PR info for Claude
+          echo "$PR_INFO" > .claude-review/pr-info/pr-info.json
+          
+          # Set environment variables
+          echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
+          echo "PR_AUTHOR=$PR_AUTHOR" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=$TARGET_BRANCH" >> $GITHUB_ENV
+          echo "SHORTCUT_API_TOKEN=${{ secrets.shortcut-token }}" >> $GITHUB_ENV
+          echo "ANTHROPIC_API_KEY=${{ secrets.anthropic-api-key }}" >> $GITHUB_ENV
+
+      - name: Add Shortcut MCP integration
+        shell: bash
+        run: |
+          cd .claude-review && claude mcp add shortcut -e SHORTCUT_API_TOKEN=${{ secrets.shortcut-token }} -- npx -y @shortcut/mcp
+          echo "Shortcut MCP integration added successfully"
+
+      - name: Generate diff and prepare for review
+        shell: bash
+        run: |
+          # Generate the diff between the PR and target branch
+          git fetch origin ${{ inputs.base-branch }}:${{ inputs.base-branch }}
+          COMMIT_BASE=$(git merge-base origin/${{ inputs.base-branch }} HEAD)
+          git diff $COMMIT_BASE..HEAD > .claude-review/pr-changes.diff
+          
+          # List changed files
+          git diff --name-only $COMMIT_BASE..HEAD > .claude-review/changed-files.txt
+          
+          # Get the total number of changed files
+          TOTAL_FILES=$(wc -l < .claude-review/changed-files.txt | tr -d ' ')
+          
+          # Limit to max files if needed
+          if [ "$TOTAL_FILES" -gt "${{ inputs.max-files }}" ]; then
+            head -n ${{ inputs.max-files }} .claude-review/changed-files.txt > .claude-review/files-to-review.txt
+            echo "Reviewing first ${{ inputs.max-files }} files out of $TOTAL_FILES changed files"
+          else
+            cp .claude-review/changed-files.txt .claude-review/files-to-review.txt
+            echo "Reviewing all $TOTAL_FILES changed files"
+          fi
+          
+          # For each file to review, get its content
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              mkdir -p ".claude-review/$(dirname "$file")"
+              cp "$file" ".claude-review/$file"
+            fi
+          done < .claude-review/files-to-review.txt
+
+      - name: Run Claude Code Review
+        shell: bash
+        id: claude-review
+        run: |
+          # Create review prompt file
+          cat > .claude-review/prompt.md << 'EOF'
+          # Code Review Task
+
+          You are an expert code reviewer examining a pull request. Please perform a thorough code review by:
+
+          1. Understanding the PR context and intended changes from the PR title, description
+          2. Looking for any Shortcut references in the PR description and commits (both ID formats like "sc-12345" and URLs like "https://app.shortcut.com/workspace/story/123/title")
+          3. Use the Shortcut mcp__shortcut__get-story tool to fetch details about any referenced stories. If you are able to retrieve the story details, indicate what stories you analyzed in your review (also indicate if no stories were found, or if stories were found but unable to be fetched [include why]).
+          4. Analyzing the code changes (diff) to identify:
+             - Bugs, logic errors, or potential issues
+             - Security vulnerabilities
+             - Performance concerns
+             - Adherence to best practices and coding standards
+             - Completeness relative to the specifications
+             - Test coverage and quality
+          5. Providing constructive feedback with specific recommendations
+          
+
+          ## PR Information
+          - Title: $PR_TITLE
+          - Author: $PR_AUTHOR
+          - Target Branch: $TARGET_BRANCH
+
+          ## Accessing Shortcut Stories
+          We use Shortcut as our ticketing system for assigning work.
+          For any Shortcut stories you identify in the PR description or commit messages:
+          1. Extract the story ID (numeric portion)
+          2. Use the mcp__shortcut__get-story tool to get the details of the story
+           (please indicate to the user if this process fails with specific details as to why) 
+          3. Review the story requirements, description, and acceptance criteria
+
+          ## Guidelines
+          - Be thorough but concise
+          - Highlight both issues and positive aspects
+          - Prioritize feedback (critical issues first)
+          - Provide specific examples and solutions when possible
+          - Consider the context of the changes and their purpose
+          - Focus on substance over style when possible
+
+          ## Final Output Format
+          Provide your review in markdown format with these sections:
+          1. **Summary** - Overall assessment and key points. Indicate what shortcut stories were used to analyze this, if any.
+          2. **Recommendations** - Prioritized list of suggested changes
+          3. **Detailed Review** - Organized by file/component with specific line references
+          4. **Questions** - Any clarifications needed from the author
+
+          Keep your review constructive and professional.
+          EOF
+
+          # Conditionally add Milchick voice instruction
+          if [ "${{ inputs.use-milchick-voice }}" = "true" ]; then
+            echo "" >> .claude-review/prompt.md # Add a newline for separation
+            echo "Additionally, adopt the persona and voice of Seth Milchick from the TV show Severance for this review. Maintain his characteristic tone and mannerisms throughout your response." >> .claude-review/prompt.md
+            echo "Milchick voice enabled."
+          else
+             echo "Standard professional voice enabled."
+          fi
+
+          # Replace environment variables in the prompt
+          envsubst < .claude-review/prompt.md > .claude-review/prompt-filled.md
+          
+          # Run Claude Code in non-interactive mode
+          echo "Starting Claude Code review process..."
+
+          cd .claude-review && claude --allowedTools "mcp__shortcut__get-story" -p \
+            "read prompt-filled.md, then analyze the PR info in pr-info/pr-info.json and the code changes in pr-changes.diff. \
+            Examine each file listed in files-to-review.txt. \
+            If you identify any Shortcut references in the PR description or commit messages, use the Shortcut API \
+            to fetch the relevant story details for additional context. \
+            Then provide a comprehensive code review as specified in the prompt." > review-output.md
+          
+          echo "Claude Code review completed"
+
+      - name: Post review comment
+        shell: bash
+        run: |
+          # Format review comment with prefix
+          REVIEW_PREFIX="🔍 **Milcheck Code Review:**"
+          REVIEW_CONTENT="$REVIEW_PREFIX
+
+          $(cat .claude-review/review-output.md)
+          
+          <sub>This review was automatically generated by Claude Code. If you have feedback on this review, please let the maintainers know.</sub>"
+          
+          # Post comment to PR
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.github-token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -w "%{http_code}" \
+            "https://api.github.com/repos/${{ inputs.repository }}/issues/${{ inputs.pr-number }}/comments" \
+            -d "{\"body\": $(echo "$REVIEW_CONTENT" | jq -s -R .)}")
+          
+          HTTP_CODE="$RESPONSE"
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "Error: Failed to post review comment. HTTP code: $HTTP_CODE"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "Review comment posted to PR #${{ inputs.pr-number }}"
